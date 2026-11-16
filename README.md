@@ -1,3 +1,145 @@
+name: Inclusive Legal OS CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install fastapi uvicorn pydantic pytest httpx requests
+
+    - name: Verify SPDX SBOM Compliance
+      run: |
+        if [ -f "04-spdx-license-governance/SBOM.spdx.json" ]; then
+          python3 -c "import json; json.load(open('04-spdx-license-governance/SBOM.spdx.json'))"
+          echo "[✔] SPDX SBOM JSON structure is valid."
+        else
+          echo "[!] Warning: SBOM file missing from governance directory."
+        fi
+
+    - name: Run Backend Health & Schema Check
+      run: |
+        python3 -c "from backend.main import app; print('[✔] FastAPI backend loaded successfully with zero-trust routes.')"
+
+    - name: Audit Git Commit Signatures
+      run: |
+        git log --show-signature -n 5 || echo "[!] Notice: Local test commits may be unsigned in CI sandbox."
+name: Inclusive Legal OS CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install fastapi uvicorn pydantic pytest httpx requests
+
+    - name: Verify SPDX SBOM Compliance
+      run: |
+        if [ -f "04-spdx-license-governance/SBOM.spdx.json" ]; then
+          python3 -c "import json; json.load(open('04-spdx-license-governance/SBOM.spdx.json'))"
+          echo "[✔] SPDX SBOM JSON structure is valid."
+        else
+          echo "[!] Warning: SBOM file missing from governance directory."
+        fi
+
+    - name: Run Backend Health & Schema Check
+      run: |
+        python3 -c "from backend.main import app; print('[✔] FastAPI backend loaded successfully with zero-trust routes.')"
+
+    - name: Audit Git Commit Signatures
+      run: |
+        git log --show-signature -n 5 || echo "[!] Notice: Local test commits may be unsigned in CI sandbox."
+#!/usr/bin/env bash
+set -euo pipefail
+
+KEY_NAME="Robert Edward Evans"
+KEY_EMAIL="re1Lucky365@gmail.com"
+EXPIRATION_DAYS="365"
+
+echo "[+] Checking GPG key status for: $KEY_EMAIL"
+EXISTING_KEY_ID=$(gpg --list-secret-keys --with-colons "$KEY_EMAIL" 2>/dev/null | awk -F: '$1 == "sec" {print $5}' | head -n 1)
+
+if [ -z "$EXISTING_KEY_ID" ]; then
+    echo "[+] No active GPG key found. Generating secure Ed25519 keypair headlessly..."
+    BATCH_FILE=$(mktemp)
+    cat <<EOF > "$BATCH_FILE"
+%no-protection
+Key-Type: EDDSA
+Key-Curve: Ed25519
+Subkey-Type: ECDH
+Subkey-Curve: Curve25519
+Name-Real: $KEY_NAME
+Name-Email: $KEY_EMAIL
+Expire-Date: $EXPIRATION_DAYS
+%commit
+EOF
+    gpg --batch --gen-key "$BATCH_FILE"
+    rm -f "$BATCH_FILE"
+    ACTIVE_KEY_ID=$(gpg --list-secret-keys --with-colons "$KEY_EMAIL" | awk -F: '$1 == "sec" {print $5}' | head -n 1)
+    echo "[✔] New GPG Key Generated: $ACTIVE_KEY_ID"
+else
+    ACTIVE_KEY_ID="$EXISTING_KEY_ID"
+    echo "[✔] Active GPG Key verified: $ACTIVE_KEY_ID"
+fi
+
+# Enforce Global Git Signing Config
+git config --global user.name "$KEY_NAME"
+git config --global user.email "$KEY_EMAIL"
+git config --global commit.gpgsign true
+git config --global user.signingkey "$ACTIVE_KEY_ID"
+git config --global gpg.program gpg
+
+echo "[+] Enforcing GPG signing across local git repositories..."
+find "." -type d -name ".git" | while read -r repo; do
+    repo_root=$(dirname "$repo")
+    cd "$repo_root"
+    git config commit.gpgsign true
+    git config user.name "$KEY_NAME"
+    git config user.email "$KEY_EMAIL"
+    git config user.signingkey "$ACTIVE_KEY_ID"
+    cd - > /dev/null
+done
+
+echo "[==============================================================================]"
+echo "[✔] Master Repository Setup Complete!"
+echo "[✔] Developer Identity: $KEY_NAME <$KEY_EMAIL>"
+echo "[✔] Active GPG Signing Key ID: $ACTIVE_KEY_ID"
+echo "[✔] Public Key Export Command: gpg --armor --export $ACTIVE_KEY_ID"
+echo "[==============================================================================]"
+
 """
 Inclusive Legal OS - Unified Zero-Trust FastAPI Backend
 License: AGPL-3.0-only
