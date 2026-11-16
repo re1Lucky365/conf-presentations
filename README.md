@@ -1,3 +1,172 @@
+main.py
+Here is a complete, production-ready FastAPI backend (main.py) for inclusive-legal-os. It acts as a zero-trust local coordinator—uniting your Ollama local COGA text simplifier, Piper neural text-to-speech bridge, and GPG-signed SQLite accommodation ledger into a single asynchronous API.
+FastAPI Backend (main.py)
+Save this script inside your repository root or under a backend/ directory:
+"""
+Inclusive Legal OS - Unified Zero-Trust FastAPI Backend
+License: AGPL-3.0-only
+"""
+import json
+import subprocess
+import hashlib
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+import urllib.request
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="Inclusive Legal OS API",
+    description="Local zero-trust backend uniting W3C COGA simplification, Piper TTS, and GPG-signed accommodation logs.",
+    version="1.0.0"
+)
+
+# Configuration paths & local endpoints
+OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
+DEFAULT_MODEL = "llama3.2:3b"
+PIPER_BIN = "/usr/local/bin/piper"
+PIPER_MODEL = "/opt/inclusive-legal-os/models/en_US-lessac-medium.onnx"
+DB_PATH = Path.home() / ".local/share/inclusive-legal-os/accommodation_ledger.db"
+
+COGA_SYSTEM_PROMPT = """You are an accessibility assistant adhering strictly to W3C COGA (Cognitive and Learning Disabilities Accessibility Task Force) Easy-Read guidelines.
+Rewrite the user's input text following these mandatory rules:
+1. Use short, direct sentences (maximum 12-15 words per sentence).
+2. Use active voice only ("You must sign this form", NOT "This form must be signed").
+3. One main idea per bullet point.
+4. Define any unavoidable legal, medical, or technical word immediately in parentheses.
+5. Never use idioms, metaphors, double negatives, or Latin legalese.
+6. Highlight deadlines, money owed, or rights waived at the very top under 'IMPORTANT THINGS TO KNOW'.
+Output valid JSON with keys: "important_warnings" (list of strings), "easy_read_steps" (list of strings), "defined_terms" (dict)."""
+
+# Pydantic Schemas
+class SimplifyRequest(BaseModel):
+    text: str = Field(..., description="Raw text, EULA, or legal document to simplify.")
+    model: str = Field(DEFAULT_MODEL, description="Ollama local model identifier.")
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., description="Easy-Read text to convert to neural speech.")
+    length_scale: float = Field(1.15, description="Pacing speed multiplier (1.15 = 15% slower).")
+
+class LedgerLogRequest(BaseModel):
+    module_name: str = Field(..., description="Name of the assistive module (e.g., 'cognitive-simplifier').")
+    accommodation_type: str = Field(..., description="Type of accommodation used (e.g., 'easy-read-tts').")
+    session_duration_sec: int = Field(..., description="Duration of the session in seconds.")
+    gpg_key_id: str | None = Field(None, description="Optional GPG signing key ID for tamper-evident logging.")
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS accommodation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc TEXT NOT NULL,
+            module_name TEXT NOT NULL,
+            accommodation_type TEXT NOT NULL,
+            session_duration_sec INTEGER NOT NULL,
+            record_sha256 TEXT NOT NULL,
+            gpg_signature TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+@app.post("/api/simplify")
+def simplify_endpoint(req: SimplifyRequest):
+    payload = {
+        "model": req.model,
+        "system": COGA_SYSTEM_PROMPT,
+        "prompt": f"Rewrite this text into Easy-Read JSON:\n\n{req.text}",
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.1}
+    }
+    try:
+        http_req = urllib.request.Request(
+            OLLAMA_ENDPOINT,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(http_req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            parsed = json.loads(body["response"])
+            return parsed
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ollama local inference failed: {str(e)}")
+
+@app.post("/api/tts")
+def tts_endpoint(req: TTSRequest):
+    output_wav = Path(f"/tmp/coga_tts_{datetime.now().timestamp()}.wav")
+    cmd = [
+        PIPER_BIN,
+        "--model", PIPER_MODEL,
+        "--length_scale", str(req.length_scale),
+        "--output_file", str(output_wav)
+    ]
+    try:
+        subprocess.run(cmd, input=req.text.encode("utf-8"), check=True, capture_output=True)
+        return FileResponse(path=output_wav, media_type="audio/wav", filename="easy_read_speech.wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Piper TTS synthesis failed: {str(e)}")
+
+@app.post("/api/ledger/log")
+def ledger_log_endpoint(req: LedgerLogRequest):
+    ts = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "timestamp_utc": ts,
+        "module_name": req.module_name,
+        "accommodation_type": req.accommodation_type,
+        "session_duration_sec": req.session_duration_sec
+    }
+    canonical = json.dumps(payload, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+
+    sig = None
+    if req.gpg_key_id:
+        cmd = ["gpg", "--batch", "--yes", "--armor", "--detach-sign", "--local-user", req.gpg_key_id]
+        proc = subprocess.run(cmd, input=canonical, capture_output=True)
+        if proc.returncode == 0:
+            sig = proc.stdout.decode("utf-8")
+        else:
+            raise HTTPException(status_code=400, detail=f"GPG signing failed: {proc.stderr.decode('utf-8')}")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO accommodation_events (timestamp_utc, module_name, accommodation_type, session_duration_sec, record_sha256, gpg_signature) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, req.module_name, req.accommodation_type, req.session_duration_sec, digest, sig)
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "timestamp_utc": ts,
+        "record_sha256": digest,
+        "signed": bool(sig)
+    }
+
+Requirements (requirements.txt)
+fastapi>=0.110.0
+uvicorn>=0.28.0
+pydantic>=2.6.0
+requests>=2.31.0
+
+How to Run Locally
+ * Install dependencies:
+   pip install -r requirements.txt
+
+ * Start the FastAPI server using Uvicorn:
+   uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+
+ * Access the interactive Swagger UI documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) to test endpoints like /api/simplify, /api/tts, and /api/ledger/log directly.
+
 # Quarkslab Publications
 
 - [Quarkslab Publications](#quarkslab-publications)
