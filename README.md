@@ -1,3 +1,28 @@
+gpg --full-gen-key
+git config --global user.signingkey <NEW_KEY_ID>
+Based on your prompt, your social media and digital accounts were hijacked. Because account compromises involve sensitive digital security recovery procedures, let's secure your infrastructure and initiate recovery immediately.
+Here is an emergency security audit and recovery checklist tailored to protect your systems, verify your identity assets, and reclaim your hijacked accounts:
+1. Immediate Infrastructure Lockdown
+Since you manage zero-trust environments and local security pipelines (Master-Hub), secure your local machine and credentials first to ensure the attackers aren't piggybacking on active sessions:
+ * Revoke GitHub Personal Access Tokens & SSH Keys: Go to GitHub Security Settings (Settings > Developer settings and Settings > SSH and GPG keys) and immediately revoke any unauthorized tokens or SSH keys added during the hijacking window.
+ * Force GPG Key Rotation: If your GPG signing keys or commit credentials were exposed, generate a fresh subkey revocation certificate and update your local git config:
+   gpg --full-gen-key
+git config --global user.signingkey <NEW_KEY_ID>
+
+ * Kill Active Sessions: Across Google, GitHub, Instagram, and TikTok, go to security settings and click "Sign out of all other sessions" to terminate any active remote tokens held by the attacker.
+2. Account Recovery Protocols
+ * Instagram / Meta Recovery:
+   * Open the Instagram app or go to [instagram.com/accounts/password/reset/](https://instagram.com/accounts/password/reset/).
+   * Enter your username (e.g., @ROBERTEDWARD4553, @ITSCHRISCASHH, or @INDIANIMAL47) or your primary email address.
+   * If the attacker changed your email/phone, tap "Need more help?" on the login screen. Instagram will prompt you for a Video Selfie verification or prompt you to submit documentation tied to your original sign-up details.
+ * TikTok Recovery:
+   * On the TikTok login screen, tap "Forgot password".
+   * Select verification via your original phone number (+1 812-786-8164) or email.
+   * If your contact info was changed, select "Feedback and help" to report a hacked account, providing your original creation details and associated handle (@anna.susa, @jakebaughman485, @elijah_morrissey08).
+3. Financial & Identity Protection
+ * Cash App & Banking Vigilance: Your Cash App Investing account (VS78A3Z) and banking portals are high-value targets during digital compromises. Ensure your PIN, biometrics, and two-factor authentication (2FA) are strictly locked down, and review recent activity statements for any unauthorized transfers.
+ * Credit Freeze Maintenance: Confirm that your security credit freezes across major bureaus remain active to prevent attackers from opening fraudulent lines of credit using leaked personal metadata.
+
 name: Inclusive Legal OS CI/CD Pipeline
 
 on:
