@@ -7,6 +7,287 @@ import json
 import subprocess
 import hashlib
 import sqlite3
+import asyncio
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+import urllib.request
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="Inclusive Legal OS API",
+    description="Local zero-trust backend uniting W3C COGA simplification, Piper TTS, and GPG-signed accommodation logs.",
+    version="1.3.0"
+)
+
+# Configuration paths & local endpoints
+OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
+DEFAULT_MODEL = "llama3.2:3b"
+PIPER_BIN = "/usr/local/bin/piper"
+PIPER_MODEL = "/opt/inclusive-legal-os/models/en_US-lessac-medium.onnx"
+AUDIO_OUTPUT_DIR = Path("/tmp")
+DB_PATH = Path.home() / ".local/share/inclusive-legal-os/accommodation_ledger.db"
+
+COGA_SYSTEM_PROMPT = """You are an accessibility assistant adhering strictly to W3C COGA (Cognitive and Learning Disabilities Accessibility Task Force) Easy-Read guidelines.
+Rewrite the user's input text following these mandatory rules:
+1. Use short, direct sentences (maximum 12-15 words per sentence).
+2. Use active voice only ("You must sign this form", NOT "This form must be signed").
+3. One main idea per bullet point.
+4. Define any unavoidable legal, medical, or technical word immediately in parentheses.
+5. Never use idioms, metaphors, double negatives, or Latin legalese.
+6. Highlight deadlines, money owed, or rights waived at the very top under 'IMPORTANT THINGS TO KNOW'.
+Output valid JSON with keys: "important_warnings" (list of strings), "easy_read_steps" (list of strings), "defined_terms" (dict)."""
+
+# Pydantic Schemas
+class SimplifyRequest(BaseModel):
+    text: str = Field(..., description="Raw text, EULA, or legal document to simplify.")
+    model: str = Field(DEFAULT_MODEL, description="Ollama local model identifier.")
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., description="Easy-Read text to convert to neural speech.")
+    length_scale: float = Field(1.15, description="Pacing speed multiplier (1.15 = 15% slower).")
+
+class LedgerLogRequest(BaseModel):
+    module_name: str = Field(..., description="Name of the assistive module (e.g., 'cognitive-simplifier').")
+    accommodation_type: str = Field(..., description="Type of accommodation used (e.g., 'easy-read-tts').")
+    session_duration_sec: int = Field(..., description="Duration of the session in seconds.")
+    gpg_key_id: str | None = Field(None, description="Optional GPG signing key ID for tamper-evident logging.")
+
+class ProcessDocumentRequest(BaseModel):
+    text: str = Field(..., description="Raw document text to process.")
+    model: str = Field(DEFAULT_MODEL, description="Ollama local model identifier.")
+    length_scale: float = Field(1.15, description="Piper TTS speech pacing speed multiplier.")
+    module_name: str = Field("document-processor", description="Assistive module name for ledger logging.")
+    accommodation_type: str = Field("easy-read-tts-ledger", description="Accommodation type tag.")
+    session_duration_sec: int = Field(60, description="Estimated session duration in seconds.")
+    gpg_key_id: str | None = Field(None, description="Optional GPG signing key ID.")
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS accommodation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc TEXT NOT NULL,
+            module_name TEXT NOT NULL,
+            accommodation_type TEXT NOT NULL,
+            session_duration_sec INTEGER NOT NULL,
+            record_sha256 TEXT NOT NULL,
+            gpg_signature TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+async def purge_expired_audio_files(interval_sec: int = 1800, max_age_sec: int = 3600):
+    """Background task: Scans AUDIO_OUTPUT_DIR every 30 minutes and deletes wav files older than 1 hour."""
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            now = time.time()
+            for file_path in AUDIO_OUTPUT_DIR.glob("coga_*.wav"):
+                if file_path.is_file():
+                    file_age = now - file_path.stat().st_mtime
+                    if file_age > max_age_sec:
+                        file_path.unlink(missing_ok=True)
+        except Exception:
+            # Silently handle disk IO exceptions during background sweeps
+            pass
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    # Launch background cleanup task non-blocking on startup
+    asyncio.create_task(purge_expired_audio_files())
+
+@app.post("/api/simplify")
+def simplify_endpoint(req: SimplifyRequest):
+    payload = {
+        "model": req.model,
+        "system": COGA_SYSTEM_PROMPT,
+        "prompt": f"Rewrite this text into Easy-Read JSON:\n\n{req.text}",
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.1}
+    }
+    try:
+        http_req = urllib.request.Request(
+            OLLAMA_ENDPOINT,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(http_req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            return json.loads(body["response"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ollama local inference failed: {str(e)}")
+
+@app.post("/api/tts")
+def tts_endpoint(req: TTSRequest):
+    filename = f"coga_tts_{datetime.now().timestamp()}.wav"
+    output_wav = AUDIO_OUTPUT_DIR / filename
+    cmd = [
+        PIPER_BIN,
+        "--model", PIPER_MODEL,
+        "--length_scale", str(req.length_scale),
+        "--output_file", str(output_wav)
+    ]
+    try:
+        subprocess.run(cmd, input=req.text.encode("utf-8"), check=True, capture_output=True)
+        return FileResponse(path=output_wav, media_type="audio/wav", filename="easy_read_speech.wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Piper TTS synthesis failed: {str(e)}")
+
+@app.post("/api/ledger/log")
+def ledger_log_endpoint(req: LedgerLogRequest):
+    ts = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "timestamp_utc": ts,
+        "module_name": req.module_name,
+        "accommodation_type": req.accommodation_type,
+        "session_duration_sec": req.session_duration_sec
+    }
+    canonical = json.dumps(payload, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+
+    sig = None
+    if req.gpg_key_id:
+        cmd = ["gpg", "--batch", "--yes", "--armor", "--detach-sign", "--local-user", req.gpg_key_id]
+        proc = subprocess.run(cmd, input=canonical, capture_output=True)
+        if proc.returncode == 0:
+            sig = proc.stdout.decode("utf-8")
+        else:
+            raise HTTPException(status_code=400, detail=f"GPG signing failed: {proc.stderr.decode('utf-8')}")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO accommodation_events (timestamp_utc, module_name, accommodation_type, session_duration_sec, record_sha256, gpg_signature) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, req.module_name, req.accommodation_type, req.session_duration_sec, digest, sig)
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "timestamp_utc": ts,
+        "record_sha256": digest,
+        "signed": bool(sig)
+    }
+
+@app.post("/api/process-document")
+def process_document_endpoint(req: ProcessDocumentRequest):
+    # 1. Simplify Text via Ollama
+    ollama_payload = {
+        "model": req.model,
+        "system": COGA_SYSTEM_PROMPT,
+        "prompt": f"Rewrite this text into Easy-Read JSON:\n\n{req.text}",
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.1}
+    }
+    try:
+        http_req = urllib.request.Request(
+            OLLAMA_ENDPOINT,
+            data=json.dumps(ollama_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(http_req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            parsed_simplification = json.loads(body["response"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Step 1 (Simplification) failed: {str(e)}")
+
+    warnings_text = ". ".join(parsed_simplification.get("important_warnings", []))
+    steps_text = ". ".join(parsed_simplification.get("easy_read_steps", []))
+    tts_corpus = f"Important things to know. {warnings_text}. Easy read steps. {steps_text}"
+
+    # 2. Generate Audio via Piper TTS
+    audio_filename = f"coga_processed_{datetime.now().timestamp()}.wav"
+    output_wav = AUDIO_OUTPUT_DIR / audio_filename
+    tts_cmd = [
+        PIPER_BIN,
+        "--model", PIPER_MODEL,
+        "--length_scale", str(req.length_scale),
+        "--output_file", str(output_wav)
+    ]
+    try:
+        subprocess.run(tts_cmd, input=tts_corpus.encode("utf-8"), check=True, capture_output=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Step 2 (TTS Synthesis) failed: {str(e)}")
+
+    # 3. Log Accommodation Event to GPG Ledger
+    ts = datetime.now(timezone.utc).isoformat()
+    ledger_payload = {
+        "timestamp_utc": ts,
+        "module_name": req.module_name,
+        "accommodation_type": req.accommodation_type,
+        "session_duration_sec": req.session_duration_sec
+    }
+    canonical = json.dumps(ledger_payload, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+
+    sig = None
+    if req.gpg_key_id:
+        gpg_cmd = ["gpg", "--batch", "--yes", "--armor", "--detach-sign", "--local-user", req.gpg_key_id]
+        proc = subprocess.run(gpg_cmd, input=canonical, capture_output=True)
+        if proc.returncode == 0:
+            sig = proc.stdout.decode("utf-8")
+        else:
+            raise HTTPException(status_code=400, detail=f"Step 3 (GPG Signing) failed: {proc.stderr.decode('utf-8')}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO accommodation_events (timestamp_utc, module_name, accommodation_type, session_duration_sec, record_sha256, gpg_signature) VALUES (?, ?, ?, ?, ?, ?)",
+            (ts, req.module_name, req.accommodation_type, req.session_duration_sec, digest, sig)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Step 3 (Ledger DB write) failed: {str(e)}")
+
+    return {
+        "status": "success",
+        "simplification": parsed_simplification,
+        "audio_filename": audio_filename,
+        "audio_download_url": f"/api/audio/{audio_filename}",
+        "ledger_receipt": {
+            "timestamp_utc": ts,
+            "record_sha256": digest,
+            "signed": bool(sig)
+        }
+    }
+
+@app.get("/api/audio/{filename}")
+def stream_audio_endpoint(filename: str):
+    """Safely streams generated .wav files from the local temporary audio directory with path traversal protection."""
+    if not filename.startswith("coga_") or not filename.endswith(".wav") or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid audio filename requested.")
+
+    target_path = (AUDIO_OUTPUT_DIR / filename).resolve()
+    if target_path.parent != AUDIO_OUTPUT_DIR.resolve() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="Generated audio file not found or expired.")
+
+    return FileResponse(
+        path=target_path,
+        media_type="audio/wav",
+        filename=filename
+    )
+
+"""
+Inclusive Legal OS - Unified Zero-Trust FastAPI Backend
+License: AGPL-3.0-only
+Operator: Robert Edward Evans <re1Lucky365@gmail.com>
+"""
+import json
+import subprocess
+import hashlib
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 import urllib.request
